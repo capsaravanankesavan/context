@@ -10,6 +10,19 @@ NEVER echo, log, print, or include the contents of the credential file or any pa
 the MySQL connection string (host, user, password) in any response text. The file is
 read by Bash at execution time only.
 
+## DML / DDL Hard Rule — NO EXCEPTIONS
+
+**NEVER execute any INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, TRUNCATE, or any other
+DDL/DML statement via Bash.** This skill is READ-ONLY.
+
+If the user asks for data modifications (UPDATE, INSERT, DELETE, schema changes):
+1. **Generate the SQL statement** and present it clearly in a code block
+2. **Tell the user:** "Run this via the hotswap app — it requires approval before execution."
+3. **Do NOT execute it** via `$(cat ~/.capillary/mysql_*) --batch -e "..."` under any circumstances.
+
+This rule exists because all production data changes must go through the hotswap approval workflow.
+No exceptions — not even for test data, test series, or test orgs.
+
 ## Safety Rules (enforce on EVERY query — no exceptions)
 
 **Proxy row limit:** The MySQL proxy enforces a hard 1000-row cap. Never issue a query
