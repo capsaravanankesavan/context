@@ -180,3 +180,48 @@ None — this session was design and documentation work, not production code mod
   definition AND the `@RabbitListener(containerFactory=...)` update must deploy together (PR-2).
   The bean alone does nothing; the annotation change alone breaks the listener. They are a single
   atomic deployment unit.
+
+---
+
+## Session: 2026-05-14 — CAP-0514-0030-V2 (MongoDB v2 Routing)
+
+### Codebase Patterns Discovered
+
+- **`VendorRedemptionRepository.getVendorRedemptionsByIds(orgId, List<Long>)`** exists at `VendorRedemptionRepository.java:91` — this is the batch vendor ID lookup method. The handoff named it `findByOrgIdAndIdIn()` which does NOT exist. Always grep the actual repository before citing method names.
+
+- **No `RewardCategoryRepository` exists** — `RewardCategory` (table `REF_REWARD_CATEGORY`) is queried via `RewardRepository.getRewardCategory(orgId, singleRewardId)`. For batch lookup, add `getRewardCategoriesForRewards(orgId, List<Long>)` to `RewardRepository`. Do not assume a dedicated repository for every entity — check the repository package first.
+
+- **`UserRewardGetDto` has 5 fields missing `@JsonInclude(NON_NULL)`**: `loyaltyProgramCriteria`, `groups`, `rewardRank`, `images`, `videos`. In v2 path these are unset → serialized as JSON `null` instead of absent → visible contract difference. Always audit the response DTO for `@JsonInclude` annotations when a v2 path intentionally omits fields.
+
+- **`UserRewardResource` does NOT inject `AuthDetails` provider** — it's only in `RewardFacade`. When a resource-layer routing decision requires `orgId`, inject `Provider<AuthDetails>` directly into the resource. This is a safe pattern (request-scoped) consistent with other facade methods.
+
+- **`SimpleDateFormat(Constants.DATE_FORMAT)` in `UserRewardHelper.buildUserRewardGetDto()` is instantiated as a LOCAL variable** (line 102), not a class field. This is the thread-safe pattern. Any new service that formats `startTime`/`endTime` must do the same — never store `SimpleDateFormat` as an `@Autowired` or instance field on a singleton service.
+
+- **`RewardDetails` actual field names differ from handoff claims:** `termNConditionsId` (getter `getTermNConditionsId()`) maps to `TERM_N_CONDITIONS`; `termsNConditionPath` (getter `getTermsNConditionPath()`) maps to `TERM_N_CONDITIONS_PATH`. Always read the `@Column` annotation + field name, not just the column name.
+
+- **`CategoryRepository.findIdsByOrgIdAndNameIn(orgId, List<String> names)`** exists and returns `List<Long>` — the correct method for batch category name→ID resolution. Use this in `buildCriteria()` rather than looping `getId(orgId, singleName)`.
+
+- **`CatalogueIndexInitializer` B2 fix**: indexes are created via explicit `ensureIndex()` calls in `@PostConstruct`, not via `@CompoundIndex` annotations (which are NOT processed at runtime because `MongoDbInitializer.createIndexes()` is commented out). When adding new doc fields that need indexes, always add them to `CatalogueIndexInitializer`, never rely on the annotation.
+
+### Design Gaps Caught (and what pattern to watch for)
+
+- **"RewardCategoryRepository" named in handoff → doesn't exist**: Detection pattern: always grep `find /path/to/repository -name "*Repository.java"` for the entity name before accepting that a repository exists.
+
+- **Missing `@JsonInclude(NON_NULL)` on response DTO fields**: Detection pattern: when a v2 path intentionally omits fields, read the DTO class and check every field that will be null for its `@JsonInclude` annotation.
+
+- **Correctness sampling calling `authDetailsProvider` from async thread**: `authDetailsProvider` is `Provider<AuthDetails>` which resolves from a `ThreadLocal` — not safe to call from a background executor thread. Correctness sampling in `RewardFacade.getAllForBrandV2()` must capture `orgId` before launching the executor task, not call `authDetailsProvider.get()` inside the Runnable.
+
+### Use Cases That Were Non-Obvious
+
+- **UC-03 (pre-existing docs missing new fields)**: When `ActiveRewardDoc` gains 11 new fields, ALL docs written before the deploy are missing them. Filter queries on new fields (`tier=X`) return zero results for those docs. This is not obvious until you think about MongoDB's schemaless nature and the rollout window. The fix is a mandatory full re-sync before enabling any org.
+
+- **UC-10 (userId parameter)**: The `userId` in `RewardFilter` triggers the `GetUserRewardsProcessor` chain in the MySQL path — specifically segment validation and card series lookup. v2 path bypasses this entirely. Not obvious from the filter field alone: `userId` is not a simple filter but a signal to run customer-specific logic.
+
+### Low-Level Guardrail Violations Found
+
+- **Null-safety for `rewardFilter.getSize()`**: In the MySQL path, null size → `Integer.MAX_VALUE` (no pagination limit). In v2 path, `skip(0).limit(MAX_VALUE)` would fetch all MongoDB documents — dangerous. Use default size of 20 if null in v2, and log WARN. This wasn't in the handoff.
+
+### Upstream / Downstream Notes
+
+- The `compareRewardsSummaryExecutor` in `RewardFacade` (line 229) is the established pattern for fire-and-forget async comparison tasks. Reuse it for correctness sampling rather than creating a new executor.
+- `CategoryRepository.findAllByIdInAndOrgId(List<Long> categoryList, Long orgId)` — note parameter order: categoryList first, then orgId. Non-obvious from the method name.
